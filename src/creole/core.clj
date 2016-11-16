@@ -274,16 +274,10 @@
 
 (defn- prefix-parser
   "Return a parser that parses prefix operators"
-  ([op rule resultfn]
-   (let [goal (fn goal [i]
-                ((choice
-                  (val 
-                   (chain op #(goal %))
-                   (fn [[_ v]] (resultfn v)))
-                  rule) i))]
-     goal))
-  ([op rule]
-   (prefix-parser op rule identity)))
+  [op goal resultfn]
+  (val 
+   (chain op goal)
+   (fn [[_ v]] (resultfn v))))
 
 (defn- infix-left-parser
   "Return a parser that parses binary left associative operators"
@@ -301,42 +295,52 @@
 
 (defn- infix-right-parser
   "Return a parser that parses binary right associative operators"
-  [op rule resultfn]
-  (let [goal (fn goal [i]
-               ((choice
-                 (val
-                  (chain rule op #(goal %))
-                  (fn [[l _ r]] (resultfn l r)))
-                 rule) i))]
-    goal))
+  [op goal rule resultfn]
+  (choice
+   (val
+    (chain rule op goal)
+    (fn [[l _ r]] (resultfn l r)))
+   rule))
 
 (defn- expr-rule-parser
   "Create a rule for an expression parser"
-  [rule [[notation op assc] resultfn]]
+  [rule goal [notation op resultfn assc]]
   (cond
-    (= notation :prefix) (prefix-parser op rule resultfn)
+    (= notation :prefix) (prefix-parser op goal resultfn)
     (= notation :infix) (cond
                           (= assc :left) (infix-left-parser op rule resultfn)
-                          (= assc :right) (infix-right-parser op rule resultfn))))
+                          (= assc :right) (infix-right-parser op goal rule resultfn))))
+
+(defn- precedence-level
+  [prev rules]
+  (let [goal (fn goal [i]
+               ((apply choice
+                       (conj
+                        (vec (map (fn [rule] (expr-rule-parser prev goal rule))
+                                  rules))
+                        prev))
+                i))]
+    goal))
+
 
 (defn expr-parser
-  "Build an expression parser out of terminals and rules"
-  [terms & rules-fns]
-  (let [rules (partition 2 rules-fns)]
-    (reduce
-     expr-rule-parser
-     terms
-     rules)))
+  "Build an expression parser out of terminals and a table of rules"
+  [terms & table]
+  (reduce
+   precedence-level
+   terms
+   table))
 
-(def expr (expr-parser (token number)
-                       [:prefix (token "-")] (fn [v] [:- v])
-                       [:prefix (token "+")] (fn [v] [:+ v])
-                       [:infix (token "^") :right] (fn [l r] [:exp l r])
-                       [:infix (token "*") :left] (fn [l r] [:* l r])
-                       [:infix (token "/") :left] (fn [l r] [:/ l r])
-                       [:infix (token "%") :left] (fn [l r] [:% l r])
-                       [:infix (token "+") :left] (fn [l r] [:+ l r])
-                       [:infix (token "-") :left] (fn [l r] [:- l r])))
+(def expr (expr-parser (choice (token number)
+                               (parens #(expr %)))
+                       [[:prefix (token "-") #(vector :- %)]
+                        [:prefix (token "+") #(vector :+ %)]]
+                       [[:infix (token "^") #(vector :exp %1 %2) :right]]
+                       [[:infix (token "*") #(vector :* %1 %2) :left]
+                        [:infix (token "/") #(vector :/ %1 %2) :left]
+                        [:infix (token "%") #(vector :% %1 %2) :left]]
+                       [[:infix (token "+") #(vector :+ %1 %2) :left]
+                        [:infix (token "-") #(vector :- %1 %2) :left]]))
 
 (defn eval-tree [ast]
   (cond
@@ -352,7 +356,7 @@
                           (= op :/) (/ (eval-tree left) (eval-tree right))
                           (= op :*) (* (eval-tree left) (eval-tree right))
                           (= op :%) (mod (eval-tree left) (eval-tree right))
-                          (= op :exp) (exp (eval-tree left) (eval-tree right))))))
+                          (= op :exp) (Math/pow (eval-tree left) (eval-tree right))))))
 
 (defn calc [str]
   (let [res (parse-all expr (init-state str))]
