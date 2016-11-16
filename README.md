@@ -1,6 +1,6 @@
 # creole
 
-A Clojure library designed to ... well, that part is up to you.
+Parser combinators written in Clojure. Designed to make parsers simple to write.
 
 ## Usage
 
