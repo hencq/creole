@@ -1,4 +1,5 @@
-(ns creole.core)
+(ns creole.core
+  (:require [clojure.set]))
 
 (defprotocol Parser
   (parse [p input] "Parse an input"))
@@ -32,7 +33,6 @@
 (defn success? [res]
   (= ::success (:tag res)))
 
-(def test-input (to-input "2 + 3 * 4"))
 
 (defn- update [m k f]
   (assoc m k (f (m k))))
@@ -55,16 +55,39 @@
   (parse [p input]
     ((str-matcher p) input)))
 
+(def counter (atom {}))
+
+(defn inc-counter [src]
+  (swap! counter
+         (fn [c]
+           (assoc c src (inc (c src 0))))))
+
+(defn reset-counter []
+  (swap! counter (fn [_] {})))
+
+(defmacro instrument [form]
+  `(do
+     (reset-counter)
+      ~form))
+
+
 (defn choice
   "Takes a seq of matchers and returns a matcher that tries all matchers in turn"
   [& matchers]
+  (inc-counter :choice)
   (fn [input]
     (let [tried (map #(parse % input) matchers)
           matched (seq (drop-while #(= ::fail (:tag %)) tried))]
       (if matched
         (first matched)
         (let [error (first tried)
-              expected (set (map #(:expected %) tried))]
+              expected (reduce
+                        (fn [s e]
+                          (if (set? e)
+                            (clojure.set/union s e)
+                            (conj s e)))
+                        #{}
+                        (map #(:expected %) tried))]
           (assoc error :expected expected))))))
 
 
@@ -76,6 +99,7 @@
 (defn chain
   "Takes a seq of parsers and returns a parser that tries to match all of them in order"
   [& matchers]
+  (inc-counter :chain)
   (fn [input]
     (let [result (reduce
                   (fn [matched parser]
@@ -111,6 +135,7 @@
 (defn many
   "Tries to match a parser zero or more times"
   [p]
+  (inc-counter :many)
   (fn [input]
     (loop [i input
            res []]
@@ -129,11 +154,13 @@
 (defn many1
   "Match a parser 1 or more times"
   [p]
-  (fn [input]
-    (let [res (parse p input)]
-      (if (success? res)
-        ((many p) input)
-        res))))
+  (inc-counter :many1)
+  (let [many-p (many p)]
+    (fn [input]
+      (let [res (parse p input)]
+        (if (success? res)
+          (many-p input)
+          res)))))
 
                                     
 (defn char-range [c1 c2]
@@ -244,34 +271,6 @@
      (first v)
      (second v))))
 
-(declare expr)
-(def term (val 
-           (chain
-            (choice
-             (chain
-              (val (token (char-choice "+-")) keyword)
-              #(term %))
-             (token number)
-             (parens #(expr %))))
-           first))
-
-(def product (val
-              (chain
-               #(term %)
-               (many (chain
-                      (token (char-choice "/*%"))
-                      #(term %))))
-              ast))
-
-(def expr (val 
-           (chain
-            (skip (many whitespace))
-            #(product %)
-            (many (chain
-                   (token (char-choice "+-"))
-                   #(product %))))
-           ast))
-
 (defn- prefix-parser
   "Return a parser that parses prefix operators"
   [op goal resultfn]
@@ -279,13 +278,15 @@
    (chain op goal)
    (fn [[_ v]] (resultfn v))))
 
+
+;; TODO rewrite so all infix left operators at the same precedence are wrapped in a choice block
 (defn- infix-left-parser
   "Return a parser that parses binary left associative operators"
   ([op rule resultfn]
    (val 
     (chain
      rule
-     (many (chain op rule)))
+     (many1 (chain op rule)))
     (fn [[left right]]
       (reduce
        (fn [l [_ r]]
@@ -313,13 +314,11 @@
 
 (defn- precedence-level
   [prev rules]
-  (let [goal (fn goal [i]
-               ((apply choice
-                       (conj
-                        (vec (map (fn [rule] (expr-rule-parser prev goal rule))
-                                  rules))
-                        prev))
-                i))]
+  (let [goal (apply choice
+                    (conj
+                     (vec (map (fn [rule] (expr-rule-parser prev goal rule))
+                               rules))
+                     prev))]
     goal))
 
 
@@ -331,16 +330,23 @@
    terms
    table))
 
+
+;; TODO figure out why the number of function calls explodes without memoize
+;; we're probably backtracking like crazy somehow
 (def expr (expr-parser (choice (token number)
-                               (parens #(expr %)))
+                               (parens expr))
                        [[:prefix (token "-") #(vector :- %)]
                         [:prefix (token "+") #(vector :+ %)]]
                        [[:infix (token "^") #(vector :exp %1 %2) :right]]
                        [[:infix (token "*") #(vector :* %1 %2) :left]
                         [:infix (token "/") #(vector :/ %1 %2) :left]
                         [:infix (token "%") #(vector :% %1 %2) :left]]
-                       [[:infix (token "+") #(vector :+ %1 %2) :left]
-                        [:infix (token "-") #(vector :- %1 %2) :left]]))
+                       [[:infix (token "-") #(vector :- %1 %2) :left]
+                        [:infix (token "+") #(vector :+ %1 %2) :left]]))
+
+(def add (expr-parser (choice number
+                              (parens add))
+                      [[:infix "+" #(vector :+ %1 %2) :left]]))
 
 (defn eval-tree [ast]
   (cond
