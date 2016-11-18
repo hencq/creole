@@ -1,5 +1,6 @@
 (ns creole.core
-  (:require [clojure.set]))
+  (:require [clojure.set]
+            [clojure.string :as string]))
 
 (defprotocol Parser
   (parse [p input] "Parse an input"))
@@ -17,6 +18,7 @@
   {:txt str
    :pos 0})
 
+
 (defn success [pos len raw result]
   {:tag ::success
    :pos pos
@@ -32,10 +34,6 @@
 
 (defn success? [res]
   (= ::success (:tag res)))
-
-
-(defn- update [m k f]
-  (assoc m k (f (m k))))
 
 (defn str-matcher
   "Returns a matcher that tries to match a string"
@@ -201,7 +199,7 @@
           res))
       res)))
 
-(defn val
+(defn with-value
   "Transform the result of a parser"
   [p f]
   (fn [input]
@@ -210,7 +208,7 @@
         (assoc res :val (f (:val res)))
         res))))
 
-(defn raw
+(defn with-raw-value
   "Use the raw result of a parser to get a value"
   ([p f]
    (fn [input]
@@ -219,7 +217,7 @@
          (assoc res :val (f (:raw res)))
          res))))
   ([p]
-   (raw p identity)))
+   (with-raw-value p identity)))
 
 (defn expect
   "Set an expected value in case the parser fails"
@@ -236,11 +234,11 @@
 (def digits (char-range \0 \9))
 (def whitespace (char-choice " \t\r\n"))
 
-(def integer (raw
+(def integer (with-raw-value
               (expect (many1 digits) "integer")
               #(java.lang.Integer/parseInt %)))
 
-(def number (raw
+(def number (with-raw-value
              (expect 
               (chain integer (option (chain "." integer)))
               "number")
@@ -249,7 +247,7 @@
 (defn token
   "Tokenizes by skipping any whitespace after the parser"
   [p]
-  (val 
+  (with-value
    (chain
     p
     (skip (many whitespace)))
@@ -258,7 +256,7 @@
 (defn parens
   "Parses a parser between parens"
   [p]
-  (val 
+  (with-value
    (chain
     (skip (token "("))
     (token p)
@@ -298,54 +296,56 @@
                             ;; have the operator parsers return their rule as a value
                             ;; we'll use these later on to distinguish between
                             ;; left/right associativity and to apply the result-fns
-                            (= type :prefix) [(conj prefix (val op (fn [_] rule)))
+                            (= type :prefix) [(conj prefix (with-value op
+                                                             (fn [_] rule)))
                                               infix]
                             (= type :infix) [prefix
-                                             (conj infix (val op (fn [_] rule)))]))
+                                             (conj infix (with-value op
+                                                           (fn [_] rule)))]))
                         [[] []]
                         rules)
         ;; build the actual parser
         prefix-parser (apply choice prefix)
         infix-parser (apply choice infix)
-        parser (chain (val (many prefix-parser) #(or % []))
+        parser (chain (with-value (many prefix-parser) #(or % []))
                       prev
-                      (val 
+                      (with-value
                        (many (chain
                               infix-parser
-                              (val (many prefix-parser) #(or % []))
+                              (with-value (many prefix-parser) #(or % []))
                               prev))
                        #(or % [])))]
     ;; The result is unwieldy. We'll transform it by applying all the result-fns in
     ;; the right order depending on associativity of the operators
-    (val parser
-         (fn [[pre prev inf :as result]]
-           (loop [res [(prefix-val prev pre)] ;;first apply any prefix operators
-                  ops []
-                  rem inf]
-             (if (seq rem) ;;loop while there are remaining infix terms
-               (let [[[_ _ rfn dir :as op] pres prev] (first rem)
-                     val (prefix-val prev pres)]
-                 (cond
-                   ;; in case of left associative, pop 1 value and apply rfn to it and
-                   ;; the matched prev value after applying prefix matches
-                   (= dir :left) (recur (conj (pop res) (rfn (peek res) val))
-                                          ops
-                                          (rest rem))
-                   ;; in case of right associative, add value and op to the stack
-                   (= dir :right) (recur (conj res val)
-                                           (conj ops op)
-                                           (rest rem))))
-               ;;when no remaining terms, we empty the ops stack
-               (if (seq ops)
-                 ;; while there are ops, pop top 2 values and 1 op and apply
-                 (let [[_ _ rfn dir] (peek ops)
-                       rhs (peek res)
-                       lhs (peek (pop res))]
-                   (recur (conj (pop (pop res)) (rfn lhs rhs))
-                          (pop ops)
-                          rem))
-                 ;; we should have 1 result left after applying all ops
-                 (first res))))))))
+    (with-value parser
+      (fn [[pre prev inf :as result]]
+        (loop [res [(prefix-val prev pre)] ;;first apply any prefix operators
+               ops []
+               rem inf]
+          (if (seq rem) ;;loop while there are remaining infix terms
+            (let [[[_ _ rfn dir :as op] pres prev] (first rem)
+                  val (prefix-val prev pres)]
+              (cond
+                ;; in case of left associative, pop 1 value and apply rfn to it and
+                ;; the matched prev value after applying prefix matches
+                (= dir :left) (recur (conj (pop res) (rfn (peek res) val))
+                                     ops
+                                     (rest rem))
+                ;; in case of right associative, add value and op to the stack
+                (= dir :right) (recur (conj res val)
+                                      (conj ops op)
+                                      (rest rem))))
+            ;;when no remaining terms, we empty the ops stack
+            (if (seq ops)
+              ;; while there are ops, pop top 2 values and 1 op and apply
+              (let [[_ _ rfn dir] (peek ops)
+                    rhs (peek res)
+                    lhs (peek (pop res))]
+                (recur (conj (pop (pop res)) (rfn lhs rhs))
+                       (pop ops)
+                       rem))
+              ;; we should have 1 result left after applying all ops
+              (first res))))))))
 
 (defn expr-parser
   "Build an expression parser out of terminals and a table of precedence rules"
