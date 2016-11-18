@@ -42,6 +42,7 @@
   [cand]
   (let [len (count cand)]
     (fn [{:keys [txt pos] :as input}]
+      (inc-counter cand)
       (if (<= (+ pos len) (count txt))
         (let [head (subs txt pos (+ pos len))]
           (if (= head cand)
@@ -74,8 +75,8 @@
 (defn choice
   "Takes a seq of matchers and returns a matcher that tries all matchers in turn"
   [& matchers]
-  (inc-counter :choice)
   (fn [input]
+    (inc-counter :choice)
     (let [tried (map #(parse % input) matchers)
           matched (seq (drop-while #(= ::fail (:tag %)) tried))]
       (if matched
@@ -99,8 +100,8 @@
 (defn chain
   "Takes a seq of parsers and returns a parser that tries to match all of them in order"
   [& matchers]
-  (inc-counter :chain)
   (fn [input]
+    (inc-counter :chain)
     (let [result (reduce
                   (fn [matched parser]
                     (let [result (parse parser
@@ -127,6 +128,7 @@
   "Makes a parser optional by always returning success"
   [p]
   (fn [input]
+    (inc-counter :option)
     (let [result (parse p input)]
       (if (= ::success (:tag result))
         result
@@ -135,8 +137,8 @@
 (defn many
   "Tries to match a parser zero or more times"
   [p]
-  (inc-counter :many)
   (fn [input]
+    (inc-counter :many)
     (loop [i input
            res []]
       (let [result (parse p i)]
@@ -154,9 +156,9 @@
 (defn many1
   "Match a parser 1 or more times"
   [p]
-  (inc-counter :many1)
   (let [many-p (many p)]
     (fn [input]
+      (inc-counter :many1)
       (let [res (parse p input)]
         (if (success? res)
           (many-p input)
@@ -185,6 +187,7 @@
       (if (success? res)
         (assoc res :val nil)
         res))))
+
 
 (defn parse-all
   "Tries to parse the whole input and fails if it can't. Contrast with parse which will
@@ -271,68 +274,96 @@
      (first v)
      (second v))))
 
-(defn- prefix-parser
-  "Return a parser that parses prefix operators"
-  [op goal resultfn]
-  (val 
-   (chain op goal)
-   (fn [[_ v]] (resultfn v))))
+(defn- infix-val
+  "Applies result-fns for infix operators from right to left"
+  [val prefixes]
+  (reduce
+   (fn [val [_ _ rfn]]
+     (rfn val))
+   val
+   (reverse prefixes)))
 
-
-;; TODO rewrite so all infix left operators at the same precedence are wrapped in a choice block
-(defn- infix-left-parser
-  "Return a parser that parses binary left associative operators"
-  ([op rule resultfn]
-   (val 
-    (chain
-     rule
-     (many1 (chain op rule)))
-    (fn [[left right]]
-      (reduce
-       (fn [l [_ r]]
-         (resultfn l r))
-       left
-       right)))))
-
-(defn- infix-right-parser
-  "Return a parser that parses binary right associative operators"
-  [op goal rule resultfn]
-  (choice
-   (val
-    (chain rule op goal)
-    (fn [[l _ r]] (resultfn l r)))
-   rule))
-
-(defn- expr-rule-parser
-  "Create a rule for an expression parser"
-  [rule goal [notation op resultfn assc]]
-  (cond
-    (= notation :prefix) (prefix-parser op goal resultfn)
-    (= notation :infix) (cond
-                          (= assc :left) (infix-left-parser op rule resultfn)
-                          (= assc :right) (infix-right-parser op goal rule resultfn))))
-
-(defn- precedence-level
+(defn- precedence
+  "Creates a parser for a precedence level. Precedence levels are a vector of rules.
+  Each rule is formatted as [type op result-fn <direction>]
+  Type is one of :infix or :prefix
+  Op is a parser
+  result-fn gets applied to the values to either side of the op
+  direction is one of :left or :right
+  "
   [prev rules]
-  (let [goal (apply choice
-                    (conj
-                     (vec (map (fn [rule] (expr-rule-parser prev goal rule))
-                               rules))
-                     prev))]
-    goal))
-
+  (let [[prefix infix] (reduce ;; Create 2 vectors of prefix and infix operators
+                        (fn [[prefix infix] [type op rfn order :as rule]]
+                          (cond
+                            ;; have the operator parsers return their rule as a value
+                            ;; we'll use these later on to distinguish between
+                            ;; left/right associativity and to apply the result-fns
+                            (= type :prefix) [(conj prefix (val op (fn [_] rule)))
+                                              infix]
+                            (= type :infix) [prefix
+                                             (conj infix (val op (fn [_] rule)))]))
+                        [[] []]
+                        rules)
+        ;; build the actual parser
+        prefix-parser (apply choice prefix)
+        infix-parser (apply choice infix)
+        parser (chain (val (many prefix-parser) #(or % []))
+                      prev
+                      (val 
+                       (many (chain
+                              infix-parser
+                              (val (many prefix-parser) #(or % []))
+                              prev))
+                       #(or % [])))]
+    ;; The result is unwieldy. We'll transform it by applying all the result-fns in
+    ;; the right order depending on associativity of the operators
+    (val parser
+         (fn [[pre prev inf :as result]]
+           (loop [res [(prefix-val prev pre)] ;;first apply any prefix operators
+                  ops []
+                  rem inf]
+             (if (seq rem) ;;loop while there are remaining infix terms
+               (let [[[_ _ rfn dir :as op] pres prev] (first rem)
+                     val (prefix-val prev pres)]
+                 (cond
+                   ;; in case of left associative, pop 1 value and apply rfn to it and
+                   ;; the matched prev value after applying prefix matches
+                   (= dir :left) (recur (conj (pop res) (rfn (peek res) val))
+                                          ops
+                                          (rest rem))
+                   ;; in case of right associative, add value and op to the stack
+                   (= dir :right) (recur (conj res val)
+                                           (conj ops op)
+                                           (rest rem))))
+               ;;when no remaining terms, we empty the ops stack
+               (if (seq ops)
+                 ;; while there are ops, pop top 2 values and 1 op and apply
+                 (let [[_ _ rfn dir] (peek ops)
+                       rhs (peek res)
+                       lhs (peek (pop res))]
+                   (recur (conj (pop (pop res)) (rfn lhs rhs))
+                          (pop ops)
+                          rem))
+                 ;; we should have 1 result left after applying all ops
+                 (first res))))))))
 
 (defn expr-parser
-  "Build an expression parser out of terminals and a table of rules"
+  "Build an expression parser out of terminals and a table of precedence rules"
   [terms & table]
   (reduce
-   precedence-level
+   precedence
    terms
    table))
 
+(defn unary [op]
+  (fn [val]
+    [op val]))
 
-;; TODO figure out why the number of function calls explodes without memoize
-;; we're probably backtracking like crazy somehow
+(defn binary [op]
+  (fn [lhs rhs]
+    [op lhs rhs]))
+
+;; Parse simple arithmetic expressions
 (def expr (expr-parser (choice (token number)
                                (parens expr))
                        [[:prefix (token "-") #(vector :- %)]
@@ -344,9 +375,6 @@
                        [[:infix (token "-") #(vector :- %1 %2) :left]
                         [:infix (token "+") #(vector :+ %1 %2) :left]]))
 
-(def add (expr-parser (choice number
-                              (parens add))
-                      [[:infix "+" #(vector :+ %1 %2) :left]]))
 
 (defn eval-tree [ast]
   (cond
