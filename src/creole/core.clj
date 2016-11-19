@@ -11,13 +11,13 @@
   (parse [p input]
     (p input)))
 
-
 (defn init-state
   "Takes a string and produces an initial parser state"
   [txt]
-  {:txt txt
-   :lines (vec (string/split-lines txt))
-   :pos [0 0]})
+  (let [lines (string/split-lines txt)
+        lines (conj (pop (mapv #(str % "\n") lines)) (peek lines))]
+    {:lines lines
+     :pos [0 0]}))
 
 (defn advance-state
   "Moves the cursor in the state forward by n characters"
@@ -35,7 +35,9 @@
       (assoc state :pos pos))))
 
 
-(defn- update-state [state result]
+(defn- update-state
+  "Take a state and a result and advance the cursor on success"
+  [state result]
   (if (= ::success (:tag result))
     (advance-state state (:len result))
     result))
@@ -85,6 +87,8 @@
   (parse [p input]
     ((str-matcher p) input)))
 
+;; Some helper functions to profile. By sprinkling functions with
+;; inc-counter it's easy to see where a parser spends most of its time
 (def counter (atom {}))
 
 (defn inc-counter [src]
@@ -182,7 +186,9 @@
           res)))))
 
                                     
-(defn char-range [c1 c2]
+(defn char-range
+  "Matcher that checks whether a character is in a certain range"
+  [c1 c2]
   (fn [input]
     (let [char (substring input 1)]
       (if (and
@@ -192,7 +198,9 @@
         (success (:pos input) 1 char char)
         (error (:pos input) (str c1 "-" c2) char)))))
 
-(defn char-choice [string]
+(defn char-choice
+  "Match any of the characters in a string"
+  [string]
   (apply choice (map str string)))
 
 (defn skip
@@ -280,17 +288,9 @@
     (skip (token ")")))
    first))
 
-(defn- ast [v]
-  (if (= (count v) 1)
-    (first v)
-    (reduce
-     (fn [expr [op right]]
-       [(keyword op) expr right])
-     (first v)
-     (second v))))
 
-(defn- infix-val
-  "Applies result-fns for infix operators from right to left"
+(defn- prefix-val
+  "Applies result-fns for prefix operators from right to left"
   [val prefixes]
   (reduce
    (fn [val [_ _ rfn]]
