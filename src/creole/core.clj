@@ -14,10 +14,43 @@
 
 (defn init-state
   "Takes a string and produces an initial parser state"
-  [str]
-  {:txt str
-   :pos 0})
+  [txt]
+  {:txt txt
+   :lines (vec (string/split-lines txt))
+   :pos [0 0]})
 
+(defn advance-state
+  "Moves the cursor in the state forward by n characters"
+  [state n]
+  (loop [[lnum col :as pos] (:pos state)
+         n n]
+    (if (> n 0)
+      (if (>= lnum (count (:lines state)))
+        (assoc state :pos ::eof)
+        (let [len (count (nth (:lines state) lnum))
+              rpad (- len col)]
+          (if (>= n rpad)
+            (recur [(inc lnum) 0] (- n rpad))
+            (recur [lnum (+ col n)] 0))))
+      (assoc state :pos pos))))
+
+
+(defn- update-state [state result]
+  (if (= ::success (:tag result))
+    (advance-state state (:len result))
+    result))
+
+(defn substring
+  "Return the string at a given position in a multiline input"
+  ([state len]
+   (let [[startline col] (:pos state)
+         endpos (:pos (advance-state state len))]
+     (if (= endpos ::eof)
+       ::eof
+       (subs 
+        (string/join "" (take (inc (first endpos)) (drop startline (:lines state))))
+        col
+        (+ col len))))))
 
 (defn success [pos len raw result]
   {:tag ::success
@@ -38,15 +71,13 @@
 (defn str-matcher
   "Returns a matcher that tries to match a string"
   [cand]
-  (let [len (count cand)]
-    (fn [{:keys [txt pos] :as input}]
-      (inc-counter cand)
-      (if (<= (+ pos len) (count txt))
-        (let [head (subs txt pos (+ pos len))]
-          (if (= head cand)
-            (success pos len head head)
-            (error pos cand head)))
-        (error pos cand (subs txt pos))))))
+  (fn [input]
+    (inc-counter cand)
+    (let [len (count cand)
+          s (substring input len)]
+      (if (= s cand)
+        (success (:pos input) len s s)
+        (error (:pos input) cand s)))))
 
 ;; Strings participate in the Parser protocol
 (extend-type java.lang.String
@@ -90,11 +121,6 @@
           (assoc error :expected expected))))))
 
 
-(defn- update-state [state result]
-  (if (= ::success (:tag result))
-    (assoc state :pos (+ (:pos state) (:len result)))
-    result))
-
 (defn chain
   "Takes a seq of parsers and returns a parser that tries to match all of them in order"
   [& matchers]
@@ -116,10 +142,7 @@
                   matchers)]
       (if (= ::success (:tag result))
         ;; get the raw match
-        (let [startpos (:pos input)
-              endpos (+ startpos (:len result))
-              raw (subs (:txt input) startpos endpos)]
-          (assoc result :raw raw))
+        (assoc result :raw (substring input (:len result)))
         result))))
 
 (defn option
@@ -138,18 +161,14 @@
   (fn [input]
     (inc-counter :many)
     (loop [i input
-           res []]
+           res []
+           raw ""]
       (let [result (parse p i)]
         (if (= ::success (:tag result))
           (recur (update-state i result)
-                 (conj res (:val result)))
-          (let [startpos (:pos input)
-                endpos (:pos i)
-                len (- endpos startpos)
-                raw (subs (:txt input) startpos endpos)
-                ;; ignore empty matches
-                res (if (empty? res) nil res)] 
-            (success startpos len raw res)))))))
+                 (conj res (:val result))
+                 (str raw (:raw result)))
+          (success (:pos input) (count raw) raw res))))))
 
 (defn many1
   "Match a parser 1 or more times"
@@ -165,14 +184,13 @@
                                     
 (defn char-range [c1 c2]
   (fn [input]
-    (if (>= (:pos input) (count (:txt input)))
-      (error (:pos input) (str c1 "-" c2) ::eof)
-      (let [char (.charAt (:txt input) (:pos input))]
-        (if (and (>= (int char) (int c1))
-                 (>= (int c2) (int char)))
-          (success (:pos input) 1 (str char) (str char))
-          (error (:pos input) (str c1 "-" c2) (subs (:txt input) (:pos input)
-                                                    (inc (:pos input)))))))))
+    (let [char (substring input 1)]
+      (if (and
+           (not= char ::eof)
+           (>= (int (first char)) (int c1))
+           (>= (int c2) (int (first char))))
+        (success (:pos input) 1 char char)
+        (error (:pos input) (str c1 "-" c2) char)))))
 
 (defn char-choice [string]
   (apply choice (map str string)))
@@ -193,10 +211,9 @@
   [p input]
   (let [res (parse p input)]
     (if (success? res)
-      (let [endpos (+ (:pos input) (:len res))]
-        (if (< endpos (count (:txt input)))
-          (error endpos ::eof (subs (:txt input) endpos (inc endpos)))
-          res))
+      (if (= ::eof (advance-state input (inc (:len res))))
+        (error (:pos input) ::eof (substring input 1))
+        res)
       res)))
 
 (defn with-value
@@ -235,7 +252,7 @@
 (def whitespace (char-choice " \t\r\n"))
 
 (def integer (with-raw-value
-              (expect (many1 digits) "integer")
+               (expect (many1 digits) "integer")
               #(java.lang.Integer/parseInt %)))
 
 (def number (with-raw-value
@@ -307,14 +324,12 @@
         ;; build the actual parser
         prefix-parser (apply choice prefix)
         infix-parser (apply choice infix)
-        parser (chain (with-value (many prefix-parser) #(or % []))
+        parser (chain (many prefix-parser)
                       prev
-                      (with-value
-                       (many (chain
-                              infix-parser
-                              (with-value (many prefix-parser) #(or % []))
-                              prev))
-                       #(or % [])))]
+                      (many (chain
+                             infix-parser
+                             (many prefix-parser)
+                             prev)))]
     ;; The result is unwieldy. We'll transform it by applying all the result-fns in
     ;; the right order depending on associativity of the operators
     (with-value parser
@@ -366,14 +381,14 @@
 ;; Parse simple arithmetic expressions
 (def expr (expr-parser (choice (token number)
                                (parens expr))
-                       [[:prefix (token "-") #(vector :- %)]
-                        [:prefix (token "+") #(vector :+ %)]]
-                       [[:infix (token "^") #(vector :exp %1 %2) :right]]
-                       [[:infix (token "*") #(vector :* %1 %2) :left]
-                        [:infix (token "/") #(vector :/ %1 %2) :left]
-                        [:infix (token "%") #(vector :% %1 %2) :left]]
-                       [[:infix (token "-") #(vector :- %1 %2) :left]
-                        [:infix (token "+") #(vector :+ %1 %2) :left]]))
+                       [[:prefix (token "-") (unary :-)]
+                        [:prefix (token "+") (unary :+)]]
+                       [[:infix (token "^") (binary :exp) :right]]
+                       [[:infix (token "*") (binary :*) :left]
+                        [:infix (token "/") (binary :/) :left]
+                        [:infix (token "%") (binary :%) :left]]
+                       [[:infix (token "-") (binary :-) :left]
+                        [:infix (token "+") (binary :+) :left]]))
 
 
 (defn eval-tree [ast]
