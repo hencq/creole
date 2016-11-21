@@ -2,6 +2,22 @@
   (:require [clojure.set]
             [clojure.string :as string]))
 
+;; Some helper functions to profile. By sprinkling functions with
+;; inc-counter it's easy to see where a parser spends most of its time
+(def counter (atom {}))
+
+(defn inc-counter [src]
+  (swap! counter
+         (fn [c]
+           (assoc c src (inc (c src 0))))))
+
+(defn reset-counter []
+  (swap! counter (fn [_] {})))
+
+(defmacro instrument [form]
+  `(do
+     (reset-counter)
+      ~form))
 (defprotocol Parser
   (parse [p input] "Parse an input"))
 
@@ -11,13 +27,16 @@
   (parse [p input]
     (p input)))
 
+(defn- split-lines [txt]
+  (mapv first
+        (drop-last 
+         (re-seq #"[^\r\n]*(\z|\r?\n)" txt))))
+
 (defn init-state
   "Takes a string and produces an initial parser state"
   [txt]
-  (let [lines (string/split-lines txt)
-        lines (conj (pop (mapv #(str % "\n") lines)) (peek lines))]
-    {:lines lines
-     :pos [0 0]}))
+  {:lines (map first (drop-last (re-seq #"[^\r\n]*(\z|\r?\n)" txt)))
+   :pos [0 0]})
 
 (defn advance-state
   "Moves the cursor in the state forward by n characters"
@@ -86,24 +105,6 @@
   Parser
   (parse [p input]
     ((str-matcher p) input)))
-
-;; Some helper functions to profile. By sprinkling functions with
-;; inc-counter it's easy to see where a parser spends most of its time
-(def counter (atom {}))
-
-(defn inc-counter [src]
-  (swap! counter
-         (fn [c]
-           (assoc c src (inc (c src 0))))))
-
-(defn reset-counter []
-  (swap! counter (fn [_] {})))
-
-(defmacro instrument [form]
-  `(do
-     (reset-counter)
-      ~form))
-
 
 (defn choice
   "Takes a seq of matchers and returns a matcher that tries all matchers in turn"
@@ -212,6 +213,14 @@
         (assoc res :val nil)
         res))))
 
+(defn look-ahead
+  "Does not consume anything if the parse is successful"
+  [p]
+  (fn [input]
+    (let [res (parse p input)]
+      (if (success? res)
+        (assoc res :len 0)
+        res))))
 
 (defn parse-all
   "Tries to parse the whole input and fails if it can't. Contrast with parse which will
@@ -257,7 +266,14 @@
 (def uppercase (char-range \A \Z))
 (def letters (choice lowercase uppercase))
 (def digits (char-range \0 \9))
+(def spaces (char-choice " \t"))
 (def whitespace (char-choice " \t\r\n"))
+(def new-line (chain (option "\r") "\n"))
+(defn eof [input]
+  (if (= ::eof (:pos (advance-state input 1)))
+    (success (:pos input) 0 "" ::eof)
+    (error (:pos input) ::eof (substring input 1))))
+
 
 (def integer (with-raw-value
                (expect (many1 digits) "integer")
@@ -269,13 +285,19 @@
               "number")
              #(java.lang.Float/parseFloat %)))
 
+(def identifier (with-raw-value
+                  (expect
+                   (chain (choice "_" letters)
+                          (many (choice letters digits "_")))
+                   "identifier")))
+
 (defn token
   "Tokenizes by skipping any whitespace after the parser"
   [p]
   (with-value
    (chain
     p
-    (skip (many whitespace)))
+    (skip (many spaces)))
    first))
 
 (defn parens
@@ -378,9 +400,16 @@
   (fn [lhs rhs]
     [op lhs rhs]))
 
+(defmacro wrap [name]
+  `(fn [& args#]
+      (apply ~name args#)))
+
+(declare expr)
+
 ;; Parse simple arithmetic expressions
-(def expr (expr-parser (choice (token number)
-                               (parens expr))
+(def math-expr (expr-parser (choice (token number)
+                                    (token identifier)
+                                    (parens (wrap expr)))
                        [[:prefix (token "-") (unary :-)]
                         [:prefix (token "+") (unary :+)]]
                        [[:infix (token "^") (binary :exp) :right]]
@@ -390,32 +419,57 @@
                        [[:infix (token "-") (binary :-) :left]
                         [:infix (token "+") (binary :+) :left]]))
 
+(def let-expr (with-value (chain 
+                           (skip (many whitespace))
+                           (skip (token "let"))
+                           (token identifier)
+                           (skip (token "="))
+                           (wrap expr)
+                           (with-value
+                             (chain 
+                              (skip new-line)
+                              (many (chain (wrap expr) (skip new-line)))
+                              (option (wrap expr))
+                              (skip (look-ahead (choice "}" eof))))
+                             #(apply conj %)))
+                (fn [[var val exprs]]
+                  [:let var val exprs])))
 
-(defn eval-tree [ast]
+(def block (with-value  (chain
+                         (skip (token "{"))
+                         (skip (many whitespace))
+                         (many (with-value (chain (wrap expr) (skip new-line)) first))
+                         (option (wrap expr))
+                         (skip (token "}")))
+             (fn [[exprs expr]]
+               [:block (conj exprs expr)])))
+
+(def expr (choice let-expr math-expr block))
+
+(def program (many (with-value (chain expr (skip (choice eof new-line))) first)))
+
+(defn eval-tree [ast env]
   (cond
     (number? ast) ast
+    (string? ast) (if-let [val (env ast)]
+                    val
+                    (throw (Error. (str ast " is not defined."))))
     (= (count ast) 2) (let [[op term] ast]
                         (cond
-                          (= op :-) (- (eval-tree term))
-                          (= op :+) (eval-tree term)))
+                          (= op :-) (- (eval-tree term env))
+                          (= op :+) (eval-tree term env)))
     (= (count ast) 3) (let [[op left right] ast]
                         (cond
-                          (= op :+) (+ (eval-tree left) (eval-tree right))
-                          (= op :-) (- (eval-tree left) (eval-tree right))
-                          (= op :/) (/ (eval-tree left) (eval-tree right))
-                          (= op :*) (* (eval-tree left) (eval-tree right))
-                          (= op :%) (mod (eval-tree left) (eval-tree right))
-                          (= op :exp) (Math/pow (eval-tree left) (eval-tree right))))))
+                          (= op :+) (+ (eval-tree left env) (eval-tree right env))
+                          (= op :-) (- (eval-tree left env) (eval-tree right env))
+                          (= op :/) (/ (eval-tree left env) (eval-tree right env))
+                          (= op :*) (* (eval-tree left env) (eval-tree right env))
+                          (= op :%) (mod (eval-tree left env) (eval-tree right env))
+                          (= op :exp) (Math/pow (eval-tree left env)
+                                                (eval-tree right env))))))
 
-(defn calc [str]
+(defn calc [str env]
   (let [res (parse-all expr (init-state str))]
     (if (success? res)
-      (eval-tree (:val res))
+      (eval-tree (:val res) env)
       res)))
-
-
-
-
-
-
-
